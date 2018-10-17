@@ -44,7 +44,7 @@ Parameters:
     -t type         -- Type of image can be one of (default iso+zmfs):
                     -- iso, iso+mfs, iso+zmfs, usb, usb+mfs, usb+zmfs,
                        rawdisk, zrawdisk, tar, firmware, rawfirmware,
-                       embedded, dump
+                       embedded, dump, vagrant+vbox
     -X excludefile  -- File containing the list in cpdup format
     -z set          -- Set
 EOF
@@ -157,7 +157,7 @@ while getopts "c:f:h:j:m:n:o:p:s:t:X:z:" FLAG; do
 			case ${MEDIATYPE} in
 			iso|iso+mfs|iso+zmfs|usb|usb+mfs|usb+zmfs) ;;
 			rawdisk|zrawdisk|tar|firmware|rawfirmware) ;;
-			embedded|dump) ;;
+			embedded|dump|vagrant+vbox) ;;
 			*) err 1 "invalid mediatype: ${MEDIATYPE}"
 			esac
 			;;
@@ -214,7 +214,7 @@ jail_exists ${JAILNAME} || err 1 "The jail ${JAILNAME} does not exist"
 _jget arch ${JAILNAME} arch
 get_host_arch host_arch
 case "${MEDIATYPE}" in
-usb|*firmware|*rawdisk|embedded|dump)
+usb|*firmware|*rawdisk|embedded|dump|*vbox)
 	[ -n "${IMAGESIZE}" ] || err 1 "Please specify the imagesize"
 	_jget mnt ${JAILNAME} mnt
 	test -f ${mnt}/boot/kernel/kernel || err 1 "The ${MEDIATYPE} media type requires a jail with a kernel"
@@ -291,7 +291,7 @@ embedded)
 	mkdir -p ${WRKDIR}/world/boot/msdos
 	mount_msdosfs /dev/${md}s1 /${WRKDIR}/world/boot/msdos
 	;;
-rawdisk|dump)
+rawdisk|dump|*vbox)
 	truncate -s ${IMAGESIZE} ${WRKDIR}/raw.img
 	md=$(/sbin/mdconfig ${WRKDIR}/raw.img)
 	newfs -j -L ${IMAGENAME} /dev/${md}
@@ -364,6 +364,11 @@ if [ -n "${PACKAGELIST}" ]; then
 	local: { url: file:///tmp/packages }
 	EOF
 		cat ${PACKAGELIST} | xargs chroot ${WRKDIR}/world env ASSUME_ALWAYS_YES=yes REPOS_DIR=/tmp pkg install
+		case ${MEDIATYPE} in
+			*vbox)
+				chroot ${WRKDIR}/world env ASSUME_ALWAYS_YES=yes REPOS_DIR=/tmp pkg install firstboot-freebsd-update firstboot-pkgs virtualbox-ose-additions-nox11
+			;;
+		esac
 	else
 		cat > ${WRKDIR}/world/tmp/repo.conf <<-EOF
 	FreeBSD: { enabled: false }
@@ -571,6 +576,87 @@ dump)
 	/sbin/mdconfig -d -u ${md#md}
 	md=
 	mv ${WRKDIR}/raw.dump ${OUTPUTDIR}/${FINALIMAGE}
+	;;
+vagrant+vbox)
+	FINALIMAGE=${IMAGENAME}.virtualbox.box
+	cat >> ${WRKDIR}/world/boot/loader.conf <<-EOF
+	vfs.root.mountfrom="ufs:/dev/gpt/rootfs"
+	EOF
+
+	# The firstboot_pkgs rc.d script will download the repository
+        # catalogue and install or update pkg when the instance first
+        # launches, so these files would just be replaced anyway; removing
+        # them from the image allows it to boot faster.
+        env ASSUME_ALWAYS_YES=yes pkg -c ${WRKDIR}/world clean -y -a
+        env ASSUME_ALWAYS_YES=yes pkg -c ${WRKDIR}/world delete -f -y pkg
+
+        # Vagrant instances use DHCP to get their network configuration.
+        echo 'ifconfig_DEFAULT="SYNCDHCP"' >> ${WRKDIR}/world/etc/rc.conf
+	echo 'firstboot_freebsd_update_enable="YES"' >> ${WRKDIR}/world/etc/rc.conf
+	echo 'firstboot_pkgs_enable="YES"' >> ${WRKDIR}/world/etc/rc.conf
+
+	# VirtualBox first boot pkgs
+	echo 'firstboot_pkgs_list="sudo rsync virtualbox-ose-additions-nox11"' >> ${WRKDIR}/world/etc/rc.conf
+	echo 'vboxguest_enable="YES"' >> ${WRKDIR}/world/etc/rc.conf
+	echo 'vboxservice_enable="YES"' >> ${WRKDIR}/world/etc/rc.conf
+	rm -f ${WRKDIR}/world/etc/resolv.conf
+
+        # Enable sshd by default
+        echo 'sshd_enable="YES"' >> ${WRKDIR}/world/etc/rc.conf
+        # Disable DNS lookups by default to make SSH connect quickly
+        echo 'UseDNS no' >> ${WRKDIR}/world/etc/ssh/sshd_config
+
+        # Disable sendmail
+        echo 'sendmail_enable="NO"' >> ${WRKDIR}/world/etc/rc.conf
+        echo 'sendmail_submit_enable="NO"' >> ${WRKDIR}/world/etc/rc.conf
+        echo 'sendmail_outbound_enable="NO"' >> ${WRKDIR}/world/etc/rc.conf
+        echo 'sendmail_msp_queue_enable="NO"' >> ${WRKDIR}/world/etc/rc.conf
+
+	# Create the vagrant user with a password of vagrant
+	/usr/sbin/pw -R ${WRKDIR}/world groupadd vagrant -g 1001
+	/usr/sbin/pw -R ${WRKDIR}/world useradd vagrant -m -M 0755 -w yes -n vagrant -u 1001 -g 1001 -G 0 -c 'Vagrant User' -d '/home/vagrant' -s '/bin/csh'
+	echo 'vagrant' | /usr/sbin/pw -R ${WRKDIR}/world usermod root -h 0
+	echo 'vagrant ALL=(ALL) NOPASSWD: ALL' >> ${WRKDIR}/world/usr/local/etc/sudoers
+
+        # Configure the vagrant ssh key
+        mkdir ${WRKDIR}/world/home/vagrant/.ssh
+        chmod 700 ${WRKDIR}/world/home/vagrant/.ssh
+        echo "ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA6NF8iallvQVp22WDkTkyrtvp9eWW6A8YVr+kz4TjGYe7gHzIw+niNltGEFHzD8+v1I2YJ6oXevct1YeS0o9HZyN1Q9qgCgzUFtdOKLv6IedplqoPkcmF0aYet2PkEDo3MlTBckFXPITAMzF8dJSIFo9D8HfdOV0IAdx4O7PtixWKn5y2hMNG0zQPyUecp4pzC6kivAIhyfHilFR61RGL+GPXQ2MWZWFYbAGjyiYJnAmCP3NOTd0jMZEnDkbUvxhMmBYSdETk1rRgm+R4LOzFUGaHqHDLKLX+FIPKcF96hrucXzcWyLbIbEgE98OHlnVYCzRdK8jlqm8tehUc9c9WhQ== vagrant insecure public key" > ${WRKDIR}/world/home/vagrant/.ssh/authorized_keys
+        chown -R 1001 ${WRKDIR}/world/home/vagrant/.ssh
+        chmod 600 ${WRKDIR}/world/home/vagrant/.ssh/authorized_keys
+
+        # Reboot quickly, Don't wait at the panic screen
+        echo 'debug.trace_on_panic=1' >> ${WRKDIR}/world/etc/sysctl.conf
+        echo 'debug.debugger_on_panic=0' >> ${WRKDIR}/world/etc/sysctl.conf
+        echo 'kern.panic_reboot_wait_time=0' >> ${WRKDIR}/world/etc/sysctl.conf
+
+        # The console is not interactive, so we might as well boot quickly.
+        echo 'autoboot_delay="-1"' >> ${WRKDIR}/world/boot/loader.conf
+
+        # The first time the VM boots, the installed "first boot" scripts
+        # should be allowed to run:
+        # * growfs (expand the filesystem to fill the provided disk)
+        # * firstboot_freebsd_update (install critical updates)
+        # * firstboot_pkgs (install packages)
+        touch ${WRKDIR}/world/firstboot
+
+	cat >> ${WRKDIR}/world/etc/fstab <<-EOF
+	/dev/gpt/${IMAGENAME} / ufs rw 1 1
+	EOF
+	cpdup -i0 ${WRKDIR}/world/boot ${WRKDIR}/out/boot
+	umount ${WRKDIR}/world
+	mkimg -s gpt -f VMDK \
+		-b ${WRKDIR}/out/boot/pmbr \
+		-p freebsd-boot/bootfs:=${WRKDIR}/out/boot/gptboot \
+		-p freebsd-swap/swapfs::1M \
+	        -p freebsd-ufs/rootfs:=${WRKDIR}/raw.img \
+	        -o ${WRKDIR}/out/vagrant.vmdk
+	/sbin/mdconfig -d -u ${md#md}
+	md=
+	(cd ${OUTPUTDIR} && echo '{"provider":"virtualbox"}' > ${WRKDIR}/out/metadata.json)
+	cp ${SCRIPTPREFIX}/box.ovf ${WRKDIR}/out
+	cp ${SCRIPTPREFIX}/Vagrantfile ${WRKDIR}/out
+	(cd ${WRKDIR}/out && tar -czf ${OUTPUTDIR}/${FINALIMAGE} metadata.json box.ovf Vagrantfile vagrant.vmdk)
 	;;
 embedded)
 	FINALIMAGE=${IMAGENAME}.img
